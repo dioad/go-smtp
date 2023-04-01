@@ -65,6 +65,9 @@ type Server struct {
 	// attempts will be rejected. This setting overrides AllowInsecureAuth.
 	AuthDisabled bool
 
+	// If set, will not show greeting to new connections
+	ReverseProxyMode bool
+
 	// The server backend.
 	Backend Backend
 
@@ -179,7 +182,9 @@ func (s *Server) handleConn(c *Conn) error {
 		}
 	}
 
-	c.greet()
+	if !s.ReverseProxyMode {
+		c.greet()
+	}
 
 	for {
 		line, err := c.readLine()
