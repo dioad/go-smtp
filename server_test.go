@@ -10,19 +10,24 @@ import (
 	"log"
 	"net"
 	"strings"
+	"sync"
 	"testing"
 
+	"github.com/emersion/go-sasl"
 	"github.com/emersion/go-smtp"
 )
 
 type message struct {
-	From string
-	To   []string
-	Data []byte
-	Opts *smtp.MailOptions
+	From     string
+	To       []string
+	RcptOpts []*smtp.RcptOptions
+	Data     []byte
+	Opts     *smtp.MailOptions
 }
 
 type backend struct {
+	authDisabled bool
+
 	messages []*message
 	anonmsgs []*message
 
@@ -65,12 +70,29 @@ type session struct {
 	msg *message
 }
 
-func (s *session) AuthPlain(username, password string) error {
-	if username != "username" || password != "password" {
-		return errors.New("Invalid username or password")
+var _ smtp.AuthSession = (*session)(nil)
+
+func (s *session) AuthMechanisms() []string {
+	if s.backend.authDisabled {
+		return nil
 	}
-	s.anonymous = false
-	return nil
+	return []string{sasl.Plain}
+}
+
+func (s *session) Auth(mech string) (sasl.Server, error) {
+	if s.backend.authDisabled {
+		return nil, smtp.ErrAuthUnsupported
+	}
+	return sasl.NewPlainServer(func(identity, username, password string) error {
+		if identity != "" && identity != username {
+			return errors.New("Invalid identity")
+		}
+		if username != "username" || password != "password" {
+			return errors.New("Invalid username or password")
+		}
+		s.anonymous = false
+		return nil
+	}), nil
 }
 
 func (s *session) Reset() {
@@ -94,8 +116,9 @@ func (s *session) Mail(from string, opts *smtp.MailOptions) error {
 	return nil
 }
 
-func (s *session) Rcpt(to string) error {
+func (s *session) Rcpt(to string, opts *smtp.RcptOptions) error {
 	s.msg.To = append(s.msg.To, to)
+	s.msg.RcptOpts = append(s.msg.RcptOpts, opts)
 	return nil
 }
 
@@ -151,6 +174,7 @@ func (s *session) LMTPData(r io.Reader, collector smtp.StatusCollector) error {
 type failingListener struct {
 	c      chan error
 	closed bool
+	mu     sync.Mutex
 }
 
 func newFailingListener() *failingListener {
@@ -158,6 +182,9 @@ func newFailingListener() *failingListener {
 }
 
 func (l *failingListener) Send(err error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
 	if !l.closed {
 		l.c <- err
 	}
@@ -168,6 +195,9 @@ func (l *failingListener) Accept() (net.Conn, error) {
 }
 
 func (l *failingListener) Close() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
 	if !l.closed {
 		close(l.c)
 		l.closed = true
@@ -203,7 +233,7 @@ type serverConfigureFunc func(*smtp.Server)
 
 var (
 	authDisabled = func(s *smtp.Server) {
-		s.AuthDisabled = true
+		s.Backend.(*backend).authDisabled = true
 	}
 )
 
@@ -288,9 +318,9 @@ func TestServerAcceptErrorHandling(t *testing.T) {
 	s.ErrorLog = log.New(errorLog, "", 0)
 
 	l := newFailingListener()
-	var serveError error
+	done := make(chan error, 1)
 	go func() {
-		serveError = s.Serve(l)
+		done <- s.Serve(l)
 		l.Close()
 	}()
 
@@ -300,6 +330,7 @@ func TestServerAcceptErrorHandling(t *testing.T) {
 	l.Send(permanentError)
 	s.Close()
 
+	serveError := <-done
 	if serveError == nil {
 		t.Fatal("Serve had exited without an expected error")
 	} else if serveError != permanentError {
@@ -466,7 +497,7 @@ func TestServer8BITMIME(t *testing.T) {
 	defer s.Close()
 	defer c.Close()
 
-	io.WriteString(c, "MAIL FROM:<alice@wonderland.book> BODY=8BITMIME\r\n")
+	io.WriteString(c, "MAIL FROM:<alice@wonderland.book> BODY=8bitMIME\r\n")
 	scanner.Scan()
 	if !strings.HasPrefix(scanner.Text(), "250 ") {
 		t.Fatal("Invalid MAIL response:", scanner.Text())
@@ -513,6 +544,8 @@ func TestServerTooBig(t *testing.T) {
 	_, s, c, scanner := testServerAuthenticated(t)
 	defer s.Close()
 	defer c.Close()
+
+	s.MaxMessageBytes = 4294967294
 
 	io.WriteString(c, "MAIL FROM:<alice@wonderland.book> SIZE=4294967295\r\n")
 	scanner.Scan()
@@ -632,6 +665,45 @@ func TestServer_LFDotLF(t *testing.T) {
 	}
 }
 
+func TestServer_EmptyMessage(t *testing.T) {
+	be, s, c, scanner := testServerAuthenticated(t)
+	defer s.Close()
+	defer c.Close()
+
+	io.WriteString(c, "MAIL FROM:<root@nsa.gov>\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatal("Invalid MAIL response:", scanner.Text())
+	}
+
+	io.WriteString(c, "RCPT TO:<root@gchq.gov.uk>\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatal("Invalid RCPT response:", scanner.Text())
+	}
+
+	io.WriteString(c, "DATA\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "354 ") {
+		t.Fatal("Invalid DATA response:", scanner.Text())
+	}
+
+	io.WriteString(c, "\r\n\r\n.\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatal("Invalid DATA response:", scanner.Text())
+	}
+
+	if len(be.messages) != 1 || len(be.anonmsgs) != 0 {
+		t.Fatal("Invalid number of sent messages:", be.messages, be.anonmsgs)
+	}
+
+	msg := be.messages[0]
+	if string(msg.Data) != "\r\n\r\n" {
+		t.Fatal("Invalid mail data:", string(msg.Data), msg.Data)
+	}
+}
+
 func TestServer_authDisabled(t *testing.T) {
 	_, s, c, scanner, caps := testServerEhlo(t, authDisabled)
 	defer s.Close()
@@ -643,7 +715,7 @@ func TestServer_authDisabled(t *testing.T) {
 
 	io.WriteString(c, "AUTH PLAIN\r\n")
 	scanner.Scan()
-	if scanner.Text() != "500 5.5.2 Syntax error, AUTH command unrecognized" {
+	if scanner.Text() != "502 5.7.0 Authentication not supported" {
 		t.Fatal("Invalid AUTH response with auth disabled:", scanner.Text())
 	}
 }
@@ -729,6 +801,67 @@ func TestServer_tooLongMessage(t *testing.T) {
 	}
 }
 
+// See https://www.postfix.org/smtp-smuggling.html
+func TestServer_smtpSmuggling(t *testing.T) {
+	cases := []struct {
+		name     string
+		lines    []string
+		expected string
+	}{
+		{
+			name: "<CR><LF>.<LF>",
+			lines: []string{
+				"This is a message with an SMTP smuggling dot:\r\n",
+				".\n",
+				"Final dot comes after.\r\n",
+				".\r\n",
+			},
+			expected: "This is a message with an SMTP smuggling dot:\r\n\nFinal dot comes after.\r\n",
+		},
+		{
+			name: "<LF>.<CR><LF>",
+			lines: []string{
+				"This is a message with an SMTP smuggling dot:\n", // not a line on its own
+				".\r\n",
+				"Final dot comes after.\r\n",
+				".\r\n",
+			},
+			expected: "This is a message with an SMTP smuggling dot:\n.\r\nFinal dot comes after.\r\n",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			be, s, c, scanner := testServerAuthenticated(t)
+			defer s.Close()
+
+			io.WriteString(c, "MAIL FROM:<root@nsa.gov>\r\n")
+			scanner.Scan()
+			io.WriteString(c, "RCPT TO:<root@gchq.gov.uk>\r\n")
+			scanner.Scan()
+			io.WriteString(c, "DATA\r\n")
+			scanner.Scan()
+
+			for _, line := range tc.lines {
+				io.WriteString(c, line)
+			}
+			scanner.Scan()
+			if !strings.HasPrefix(scanner.Text(), "250 ") {
+				t.Fatal("Invalid DATA response, expected an error but got:", scanner.Text())
+			}
+
+			if len(be.messages) != 1 {
+				t.Fatal("Invalid number of sent messages:", len(be.messages))
+			}
+
+			msg := be.messages[0]
+			if string(msg.Data) != tc.expected {
+				t.Fatalf("Invalid mail data: %q", string(msg.Data))
+			}
+		})
+	}
+}
+
 func TestServer_tooLongLine(t *testing.T) {
 	_, s, c, scanner := testServerAuthenticated(t)
 	defer s.Close()
@@ -802,7 +935,7 @@ func TestServer_authParam(t *testing.T) {
 	// >extension MUST support the AUTH parameter to the MAIL FROM
 	// >command even when the client has not authenticated itself to the
 	// >server.
-	io.WriteString(c, "MAIL FROM: root@nsa.gov AUTH=<hey+3Da>\r\n")
+	io.WriteString(c, "MAIL FROM: root@nsa.gov AUTH=hey+3Da@example.com\r\n")
 	scanner.Scan()
 	if !strings.HasPrefix(scanner.Text(), "250 ") {
 		t.Fatal("Invalid MAIL response:", scanner.Text())
@@ -823,91 +956,8 @@ func TestServer_authParam(t *testing.T) {
 	if len(be.messages) != 0 || len(be.anonmsgs) != 1 {
 		t.Fatal("Invalid number of sent messages:", be.messages, be.anonmsgs)
 	}
-	if val := be.anonmsgs[0].Opts.Auth; val == nil || *val != "hey=a" {
+	if val := be.anonmsgs[0].Opts.Auth; val == nil || *val != "hey=a@example.com" {
 		t.Fatal("Invalid Auth value:", val)
-	}
-}
-
-func testStrictServer(t *testing.T) (s *smtp.Server, c net.Conn, scanner *bufio.Scanner) {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	s = smtp.NewServer(new(backend))
-	s.Domain = "localhost"
-	s.AllowInsecureAuth = true
-	s.AuthDisabled = true
-	s.Strict = true
-
-	go s.Serve(l)
-
-	c, err = net.Dial("tcp", l.Addr().String())
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	scanner = bufio.NewScanner(c)
-
-	scanner.Scan()
-	if scanner.Text() != "220 localhost ESMTP Service Ready" {
-		t.Fatal("Invalid greeting:", scanner.Text())
-	}
-
-	io.WriteString(c, "EHLO localhost\r\n")
-
-	scanner.Scan()
-	if scanner.Text() != "250-Hello localhost" {
-		t.Fatal("Invalid EHLO response:", scanner.Text())
-	}
-
-	expectedCaps := []string{"PIPELINING", "8BITMIME"}
-	caps := make(map[string]bool)
-
-	for scanner.Scan() {
-		s := scanner.Text()
-
-		if strings.HasPrefix(s, "250 ") {
-			caps[strings.TrimPrefix(s, "250 ")] = true
-			break
-		} else {
-			if !strings.HasPrefix(s, "250-") {
-				t.Fatal("Invalid capability response:", s)
-			}
-			caps[strings.TrimPrefix(s, "250-")] = true
-		}
-	}
-
-	for _, cap := range expectedCaps {
-		if !caps[cap] {
-			t.Fatal("Missing capability:", cap)
-		}
-	}
-
-	return
-}
-
-func TestStrictServerGood(t *testing.T) {
-	s, c, scanner := testStrictServer(t)
-	defer s.Close()
-	defer c.Close()
-
-	io.WriteString(c, "MAIL FROM:<root@nsa.gov>\r\n")
-	scanner.Scan()
-	if !strings.HasPrefix(scanner.Text(), "250 ") {
-		t.Fatal("Invalid MAIL response:", scanner.Text())
-	}
-}
-
-func TestStrictServerBad(t *testing.T) {
-	s, c, scanner := testStrictServer(t)
-	defer s.Close()
-	defer c.Close()
-
-	io.WriteString(c, "MAIL FROM: root@nsa.gov\r\n")
-	scanner.Scan()
-	if strings.HasPrefix(scanner.Text(), "250 ") {
-		t.Fatal("Invalid MAIL response:", scanner.Text())
 	}
 }
 
@@ -1263,5 +1313,204 @@ func TestServerShutdown(t *testing.T) {
 	errTwo := <-errChan
 	if errTwo != smtp.ErrServerClosed {
 		t.Fatal("Expected err to be ErrServerClosed:", errTwo)
+	}
+}
+
+const (
+	dsnEnvelopeID  = "e=mc2"
+	dsnEmailRFC822 = "e=mc2@example.com"
+	dsnEmailUTF8   = "e=mc2@ドメイン名例.jp"
+)
+
+func TestServerDSN(t *testing.T) {
+	be, s, c, scanner, caps := testServerEhlo(t,
+		func(s *smtp.Server) {
+			s.EnableDSN = true
+		})
+	defer s.Close()
+	defer c.Close()
+
+	if _, ok := caps["DSN"]; !ok {
+		t.Fatal("Missing capability: DSN")
+	}
+
+	io.WriteString(c, "MAIL FROM:<e=mc2@example.com> envID=e+3Dmc2 Ret=hdrs\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatal("Invalid MAIL response:", scanner.Text())
+	}
+
+	io.WriteString(c, "RCPT TO:<e=mc2@example.com> ORcpt=Rfc822;e+3Dmc2@example.com Notify=Never\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatal("Invalid RCPT response:", scanner.Text())
+	}
+
+	io.WriteString(c, "RCPT TO:<e=mc2@example.com> orcpt=Utf-8;e\\x{3D}mc2@\\x{30C9}\\x{30E1}\\x{30A4}\\x{30F3}\\x{540D}\\x{4F8B}.jp notify=failure,delay\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatal("Invalid RCPT response:", scanner.Text())
+	}
+
+	// go on as usual
+	io.WriteString(c, "DATA\r\n")
+	scanner.Scan()
+	io.WriteString(c, "Hey <3\r\n")
+	io.WriteString(c, ".\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatal("Invalid DATA response:", scanner.Text())
+	}
+	if len(be.messages) != 0 || len(be.anonmsgs) != 1 {
+		t.Fatal("Invalid number of sent messages:", be.messages, be.anonmsgs)
+	}
+
+	if val := be.anonmsgs[0].Opts.Return; val != smtp.DSNReturnHeaders {
+		t.Fatal("Invalid RET parameter value:", val)
+	}
+	if val := be.anonmsgs[0].Opts.EnvelopeID; val != dsnEnvelopeID {
+		t.Fatal("Invalid ENVID parameter value:", val)
+	}
+
+	to := be.anonmsgs[0].To
+	if to == nil || len(to) != 2 {
+		t.Fatal("Invalid number of recipients:", to)
+	}
+	if val := to[0]; val != dsnEmailRFC822 {
+		t.Fatal("Invalid recipient:", val)
+	}
+	if val := to[1]; val != dsnEmailRFC822 {
+		t.Fatal("Invalid recipient:", val)
+	}
+
+	opts := be.anonmsgs[0].RcptOpts
+	if opts == nil || len(opts) != 2 {
+		t.Fatal("Invalid number of recipients:", opts)
+	}
+	if val := opts[0].Notify; val == nil || len(val) != 1 || val[0] != smtp.DSNNotifyNever {
+		t.Fatal("Invalid NOTIFY parameter value:", val)
+	}
+	if val := opts[0].OriginalRecipientType; val != smtp.DSNAddressTypeRFC822 {
+		t.Fatal("Invalid ORCPT address type:", val)
+	}
+	if val := opts[0].OriginalRecipient; val != dsnEmailRFC822 {
+		t.Fatal("Invalid ORCPT address:", val)
+	}
+	if val := opts[1].Notify; val == nil || len(val) != 2 || val[0] != smtp.DSNNotifyFailure || val[1] != smtp.DSNNotifyDelayed {
+		t.Fatal("Invalid NOTIFY parameter value:", val)
+	}
+	if val := opts[1].OriginalRecipientType; val != smtp.DSNAddressTypeUTF8 {
+		t.Fatal("Invalid ORCPT address type:", val)
+	}
+	if val := opts[1].OriginalRecipient; val != dsnEmailUTF8 {
+		t.Fatal("Invalid ORCPT address:", val)
+	}
+}
+
+func TestServerDSNwithSMTPUTF8(t *testing.T) {
+	be, s, c, scanner, caps := testServerEhlo(t,
+		func(s *smtp.Server) {
+			s.EnableDSN = true
+			s.EnableSMTPUTF8 = true
+		})
+	defer s.Close()
+	defer c.Close()
+
+	for _, cap := range []string{"DSN", "SMTPUTF8"} {
+		if _, ok := caps[cap]; !ok {
+			t.Fatal("Missing capability:", cap)
+		}
+	}
+
+	io.WriteString(c, "MAIL FROM:<e=mc2@example.com> ENVID=e+3Dmc2 RET=HDRS\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatal("Invalid MAIL response:", scanner.Text())
+	}
+
+	io.WriteString(c, "RCPT TO:<e=mc2@example.com> ORCPT=RFC822;e+3Dmc2@example.com NOTIFY=NEVER\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatal("Invalid RCPT response:", scanner.Text())
+	}
+
+	io.WriteString(c, "RCPT TO:<e=mc2@ドメイン名例.jp> ORCPT=UTF-8;e\\x{3D}mc2@\\x{30C9}\\x{30E1}\\x{30A4}\\x{30F3}\\x{540D}\\x{4F8B}.jp NOTIFY=FAILURE,DELAY\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatal("Invalid RCPT response:", scanner.Text())
+	}
+
+	io.WriteString(c, "RCPT TO:<e=mc2@ドメイン名例.jp> ORCPT=utf-8;e\\x{3D}mc2@ドメイン名例.jp NOTIFY=SUCCESS\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatal("Invalid RCPT response:", scanner.Text())
+	}
+
+	// go on as usual
+	io.WriteString(c, "DATA\r\n")
+	scanner.Scan()
+	io.WriteString(c, "Hey <3\r\n")
+	io.WriteString(c, ".\r\n")
+	scanner.Scan()
+	if !strings.HasPrefix(scanner.Text(), "250 ") {
+		t.Fatal("Invalid DATA response:", scanner.Text())
+	}
+	if len(be.messages) != 0 || len(be.anonmsgs) != 1 {
+		t.Fatal("Invalid number of sent messages:", be.messages, be.anonmsgs)
+	}
+
+	if val := be.anonmsgs[0].Opts.Return; val != smtp.DSNReturnHeaders {
+		t.Fatal("Invalid RET parameter value:", val)
+	}
+	if val := be.anonmsgs[0].Opts.EnvelopeID; val != dsnEnvelopeID {
+		t.Fatal("Invalid ENVID parameter value:", val)
+	}
+
+	to := be.anonmsgs[0].To
+	if to == nil || len(to) != 3 {
+		t.Fatal("Invalid number of recipients:", to)
+	}
+	if val := to[0]; val != dsnEmailRFC822 {
+		t.Fatal("Invalid recipient:", val)
+	}
+	// Non-ASCII UTF-8 is allowed in TO parameter value
+	if val := to[1]; val != dsnEmailUTF8 {
+		t.Fatal("Invalid recipient:", val)
+	}
+	if val := to[2]; val != dsnEmailUTF8 {
+		t.Fatal("Invalid recipient:", val)
+	}
+
+	opts := be.anonmsgs[0].RcptOpts
+	if opts == nil || len(opts) != 3 {
+		t.Fatal("Invalid number of recipients:", opts)
+	}
+	if val := opts[0].Notify; val == nil || len(val) != 1 || val[0] != smtp.DSNNotifyNever {
+		t.Fatal("Invalid NOTIFY parameter value:", val)
+	}
+	if val := opts[0].OriginalRecipientType; val != smtp.DSNAddressTypeRFC822 {
+		t.Fatal("Invalid ORCPT address type:", val)
+	}
+	if val := opts[0].OriginalRecipient; val != dsnEmailRFC822 {
+		t.Fatal("Invalid ORCPT address:", val)
+	}
+	if val := opts[1].Notify; val == nil || len(val) != 2 || val[0] != smtp.DSNNotifyFailure || val[1] != smtp.DSNNotifyDelayed {
+		t.Fatal("Invalid NOTIFY parameter value:", val)
+	}
+	if val := opts[1].OriginalRecipientType; val != smtp.DSNAddressTypeUTF8 {
+		t.Fatal("Invalid ORCPT address type:", val)
+	}
+	if val := opts[1].OriginalRecipient; val != dsnEmailUTF8 {
+		t.Fatal("Invalid ORCPT address:", val)
+	}
+	// utf-8-addr-unitext form is allowed in ORCPT parameter value
+	if val := opts[2].Notify; val == nil || len(val) != 1 || val[0] != smtp.DSNNotifySuccess {
+		t.Fatal("Invalid NOTIFY parameter value:", val)
+	}
+	if val := opts[2].OriginalRecipientType; val != smtp.DSNAddressTypeUTF8 {
+		t.Fatal("Invalid ORCPT address type:", val)
+	}
+	if val := opts[2].OriginalRecipient; val != dsnEmailUTF8 {
+		t.Fatal("Invalid ORCPT address:", val)
 	}
 }

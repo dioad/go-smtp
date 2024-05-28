@@ -15,6 +15,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/emersion/go-sasl"
 )
 
 // Number of errors we'll tolerate per connection before closing. Defaults to 3.
@@ -37,7 +39,7 @@ type Conn struct {
 	bdatPipe        *io.PipeWriter
 	bdatStatus      *statusCollector // used for BDAT on LMTP
 	dataResult      chan error
-	bytesReceived   int // counts total size of chunks when BDAT is used
+	bytesReceived   int64 // counts total size of chunks when BDAT is used
 
 	fromReceived bool
 	recipients   []string
@@ -127,7 +129,7 @@ func (c *Conn) handle(cmd string, arg string) {
 	case "VRFY":
 		c.writeResponse(252, EnhancedCode{2, 5, 0}, "Cannot VRFY user, but will accept message")
 	case "NOOP":
-		c.writeResponse(250, EnhancedCode{2, 0, 0}, "I have sucessfully done nothing")
+		c.writeResponse(250, EnhancedCode{2, 0, 0}, "I have successfully done nothing")
 	case "RSET": // Reset session
 		c.reset()
 		c.writeResponse(250, EnhancedCode{2, 0, 0}, "Session reset")
@@ -139,11 +141,7 @@ func (c *Conn) handle(cmd string, arg string) {
 		c.writeResponse(221, EnhancedCode{2, 0, 0}, "Bye")
 		c.Close()
 	case "AUTH":
-		if c.server.AuthDisabled {
-			c.protocolError(500, EnhancedCode{5, 5, 2}, "Syntax error, AUTH command unrecognized")
-		} else {
-			c.handleAuth(arg)
-		}
+		c.handleAuth(arg)
 	case "STARTTLS":
 		c.handleStartTLS()
 	default:
@@ -205,7 +203,7 @@ func (c *Conn) Conn() net.Conn {
 
 func (c *Conn) authAllowed() bool {
 	_, isTLS := c.TLSConnectionState()
-	return !c.server.AuthDisabled && (isTLS || c.server.AllowInsecureAuth)
+	return isTLS || c.server.AllowInsecureAuth
 }
 
 // protocolError writes errors responses and closes the connection once too many
@@ -227,17 +225,17 @@ func (c *Conn) handleGreet(enhanced bool, arg string) {
 		c.writeResponse(501, EnhancedCode{5, 5, 2}, "Domain/address argument required for HELO")
 		return
 	}
+	// c.helo is populated before NewSession so
+	// NewSession can access it via Conn.Hostname.
 	c.helo = domain
 
 	sess, err := c.server.Backend.NewSession(c)
 	if err != nil {
-		if smtpErr, ok := err.(*SMTPError); ok {
-			c.writeResponse(smtpErr.Code, smtpErr.EnhancedCode, smtpErr.Message)
-			return
-		}
-		c.writeResponse(451, EnhancedCode{4, 0, 0}, err.Error())
+		c.helo = ""
+		c.writeError(451, EnhancedCode{4, 0, 0}, err)
 		return
 	}
+
 	c.setSession(sess)
 
 	if !enhanced {
@@ -245,18 +243,26 @@ func (c *Conn) handleGreet(enhanced bool, arg string) {
 		return
 	}
 
-	caps := []string{}
-	caps = append(caps, c.server.caps...)
+	caps := []string{
+		"PIPELINING",
+		"8BITMIME",
+		"ENHANCEDSTATUSCODES",
+		"CHUNKING",
+	}
 	if _, isTLS := c.TLSConnectionState(); c.server.TLSConfig != nil && !isTLS {
 		caps = append(caps, "STARTTLS")
 	}
 	if c.authAllowed() {
+		mechs := c.authMechanisms()
+
 		authCap := "AUTH"
-		for name := range c.server.auths {
+		for _, name := range mechs {
 			authCap += " " + name
 		}
 
-		caps = append(caps, authCap)
+		if len(mechs) > 0 {
+			caps = append(caps, authCap)
+		}
 	}
 	if c.server.EnableSMTPUTF8 {
 		caps = append(caps, "SMTPUTF8")
@@ -267,10 +273,16 @@ func (c *Conn) handleGreet(enhanced bool, arg string) {
 	if c.server.EnableBINARYMIME {
 		caps = append(caps, "BINARYMIME")
 	}
+	if c.server.EnableDSN {
+		caps = append(caps, "DSN")
+	}
 	if c.server.MaxMessageBytes > 0 {
 		caps = append(caps, fmt.Sprintf("SIZE %v", c.server.MaxMessageBytes))
 	} else {
 		caps = append(caps, "SIZE")
+	}
+	if c.server.MaxRecipients > 0 {
+		caps = append(caps, fmt.Sprintf("LIMITS RCPTMAX=%v", c.server.MaxRecipients))
 	}
 
 	args := []string{"Hello " + domain}
@@ -289,106 +301,122 @@ func (c *Conn) handleMail(arg string) {
 		return
 	}
 
-	if len(arg) < 6 || strings.ToUpper(arg[0:5]) != "FROM:" {
+	arg, ok := cutPrefixFold(arg, "FROM:")
+	if !ok {
 		c.writeResponse(501, EnhancedCode{5, 5, 2}, "Was expecting MAIL arg syntax of FROM:<address>")
 		return
 	}
-	fromArgs := strings.Split(strings.Trim(arg[5:], " "), " ")
-	if c.server.Strict {
-		if !strings.HasPrefix(fromArgs[0], "<") || !strings.HasSuffix(fromArgs[0], ">") {
-			c.writeResponse(501, EnhancedCode{5, 5, 2}, "Was expecting MAIL arg syntax of FROM:<address>")
-			return
-		}
-	}
-	from := fromArgs[0]
-	if from == "" {
+
+	p := parser{s: strings.TrimSpace(arg)}
+	from, err := p.parseReversePath()
+	if err != nil {
 		c.writeResponse(501, EnhancedCode{5, 5, 2}, "Was expecting MAIL arg syntax of FROM:<address>")
 		return
 	}
-	from = strings.Trim(from, "<>")
+	args, err := parseArgs(p.s)
+	if err != nil {
+		c.writeResponse(501, EnhancedCode{5, 5, 4}, "Unable to parse MAIL ESMTP parameters")
+		return
+	}
 
 	opts := &MailOptions{}
 
 	c.binarymime = false
 	// This is where the Conn may put BODY=8BITMIME, but we already
 	// read the DATA as bytes, so it does not effect our processing.
-	if len(fromArgs) > 1 {
-		args, err := parseArgs(fromArgs[1:])
-		if err != nil {
-			c.writeResponse(501, EnhancedCode{5, 5, 4}, "Unable to parse MAIL ESMTP parameters")
-			return
-		}
-
-		for key, value := range args {
-			switch key {
-			case "SIZE":
-				size, err := strconv.ParseInt(value, 10, 32)
-				if err != nil {
-					c.writeResponse(501, EnhancedCode{5, 5, 4}, "Unable to parse SIZE as an integer")
-					return
-				}
-
-				if c.server.MaxMessageBytes > 0 && int(size) > c.server.MaxMessageBytes {
-					c.writeResponse(552, EnhancedCode{5, 3, 4}, "Max message size exceeded")
-					return
-				}
-
-				opts.Size = int(size)
-			case "SMTPUTF8":
-				if !c.server.EnableSMTPUTF8 {
-					c.writeResponse(504, EnhancedCode{5, 5, 4}, "SMTPUTF8 is not implemented")
-					return
-				}
-				opts.UTF8 = true
-			case "REQUIRETLS":
-				if !c.server.EnableREQUIRETLS {
-					c.writeResponse(504, EnhancedCode{5, 5, 4}, "REQUIRETLS is not implemented")
-					return
-				}
-				opts.RequireTLS = true
-			case "BODY":
-				switch value {
-				case "BINARYMIME":
-					if !c.server.EnableBINARYMIME {
-						c.writeResponse(504, EnhancedCode{5, 5, 4}, "BINARYMIME is not implemented")
-						return
-					}
-					c.binarymime = true
-				case "7BIT", "8BITMIME":
-				default:
-					c.writeResponse(500, EnhancedCode{5, 5, 4}, "Unknown BODY value")
-					return
-				}
-				opts.Body = BodyType(value)
-			case "AUTH":
-				value, err := decodeXtext(value)
-				if err != nil {
-					c.writeResponse(500, EnhancedCode{5, 5, 4}, "Malformed AUTH parameter value")
-					return
-				}
-				if !strings.HasPrefix(value, "<") {
-					c.writeResponse(500, EnhancedCode{5, 5, 4}, "Missing opening angle bracket")
-					return
-				}
-				if !strings.HasSuffix(value, ">") {
-					c.writeResponse(500, EnhancedCode{5, 5, 4}, "Missing closing angle bracket")
-					return
-				}
-				decodedMbox := value[1 : len(value)-1]
-				opts.Auth = &decodedMbox
-			default:
-				c.writeResponse(500, EnhancedCode{5, 5, 4}, "Unknown MAIL FROM argument")
+	for key, value := range args {
+		switch key {
+		case "SIZE":
+			size, err := strconv.ParseUint(value, 10, 32)
+			if err != nil {
+				c.writeResponse(501, EnhancedCode{5, 5, 4}, "Unable to parse SIZE as an integer")
 				return
 			}
+
+			if c.server.MaxMessageBytes > 0 && int64(size) > c.server.MaxMessageBytes {
+				c.writeResponse(552, EnhancedCode{5, 3, 4}, "Max message size exceeded")
+				return
+			}
+
+			opts.Size = int64(size)
+		case "SMTPUTF8":
+			if !c.server.EnableSMTPUTF8 {
+				c.writeResponse(504, EnhancedCode{5, 5, 4}, "SMTPUTF8 is not implemented")
+				return
+			}
+			opts.UTF8 = true
+		case "REQUIRETLS":
+			if !c.server.EnableREQUIRETLS {
+				c.writeResponse(504, EnhancedCode{5, 5, 4}, "REQUIRETLS is not implemented")
+				return
+			}
+			opts.RequireTLS = true
+		case "BODY":
+			value = strings.ToUpper(value)
+			switch BodyType(value) {
+			case BodyBinaryMIME:
+				if !c.server.EnableBINARYMIME {
+					c.writeResponse(504, EnhancedCode{5, 5, 4}, "BINARYMIME is not implemented")
+					return
+				}
+				c.binarymime = true
+			case Body7Bit, Body8BitMIME:
+				// This space is intentionally left blank
+			default:
+				c.writeResponse(501, EnhancedCode{5, 5, 4}, "Unknown BODY value")
+				return
+			}
+			opts.Body = BodyType(value)
+		case "RET":
+			if !c.server.EnableDSN {
+				c.writeResponse(504, EnhancedCode{5, 5, 4}, "RET is not implemented")
+				return
+			}
+			value = strings.ToUpper(value)
+			switch DSNReturn(value) {
+			case DSNReturnFull, DSNReturnHeaders:
+				// This space is intentionally left blank
+			default:
+				c.writeResponse(501, EnhancedCode{5, 5, 4}, "Unknown RET value")
+				return
+			}
+			opts.Return = DSNReturn(value)
+		case "ENVID":
+			if !c.server.EnableDSN {
+				c.writeResponse(504, EnhancedCode{5, 5, 4}, "ENVID is not implemented")
+				return
+			}
+			value, err := decodeXtext(value)
+			if err != nil || value == "" || !isPrintableASCII(value) {
+				c.writeResponse(501, EnhancedCode{5, 5, 4}, "Malformed ENVID parameter value")
+				return
+			}
+			opts.EnvelopeID = value
+		case "AUTH":
+			value, err := decodeXtext(value)
+			if err != nil || value == "" {
+				c.writeResponse(500, EnhancedCode{5, 5, 4}, "Malformed AUTH parameter value")
+				return
+			}
+			if value == "<>" {
+				value = ""
+			} else {
+				p := parser{s: value}
+				value, err = p.parseMailbox()
+				if err != nil || p.s != "" {
+					c.writeResponse(500, EnhancedCode{5, 5, 4}, "Malformed AUTH parameter mailbox")
+					return
+				}
+			}
+			opts.Auth = &value
+		default:
+			c.writeResponse(500, EnhancedCode{5, 5, 4}, "Unknown MAIL FROM argument")
+			return
 		}
 	}
 
 	if err := c.Session().Mail(from, opts); err != nil {
-		if smtpErr, ok := err.(*SMTPError); ok {
-			c.writeResponse(smtpErr.Code, smtpErr.EnhancedCode, smtpErr.Message)
-			return
-		}
-		c.writeResponse(451, EnhancedCode{4, 0, 0}, err.Error())
+		c.writeError(451, EnhancedCode{4, 0, 0}, err)
 		return
 	}
 
@@ -428,23 +456,192 @@ func decodeXtext(val string) (string, error) {
 	return decoded, nil
 }
 
+// This regexp matches 'EmbeddedUnicodeChar' token defined in
+// https://datatracker.ietf.org/doc/html/rfc6533.html#section-3
+// however it is intentionally relaxed by requiring only '\x{HEX}' to be
+// present.  It also matches disallowed characters in QCHAR and QUCHAR defined
+// in above.
+// So it allows us to detect malformed values and report them appropriately.
+var eUOrDCharRe = regexp.MustCompile(`\\x[{][0-9A-F]+[}]|[[:cntrl:] \\+=]`)
+
+// Decodes the utf-8-addr-xtext or the utf-8-addr-unitext form.
+func decodeUTF8AddrXtext(val string) (string, error) {
+	var replaceErr error
+	decoded := eUOrDCharRe.ReplaceAllStringFunc(val, func(match string) string {
+		if len(match) == 1 {
+			replaceErr = errors.New("disallowed character:" + match)
+			return ""
+		}
+
+		hexpoint := match[3 : len(match)-1]
+		char, err := strconv.ParseUint(hexpoint, 16, 21)
+		if err != nil {
+			replaceErr = err
+			return ""
+		}
+		switch len(hexpoint) {
+		case 2:
+			switch {
+			// all xtext-specials
+			case 0x01 <= char && char <= 0x09 ||
+				0x11 <= char && char <= 0x19 ||
+				char == 0x10 || char == 0x20 ||
+				char == 0x2B || char == 0x3D || char == 0x7F:
+			// 2-digit forms
+			case char == 0x5C || 0x80 <= char && char <= 0xFF:
+				// This space is intentionally left blank
+			default:
+				replaceErr = errors.New("illegal hexpoint:" + hexpoint)
+				return ""
+			}
+		// 3-digit forms
+		case 3:
+			switch {
+			case 0x100 <= char && char <= 0xFFF:
+				// This space is intentionally left blank
+			default:
+				replaceErr = errors.New("illegal hexpoint:" + hexpoint)
+				return ""
+			}
+		// 4-digit forms excluding surrogate
+		case 4:
+			switch {
+			case 0x1000 <= char && char <= 0xD7FF:
+			case 0xE000 <= char && char <= 0xFFFF:
+				// This space is intentionally left blank
+			default:
+				replaceErr = errors.New("illegal hexpoint:" + hexpoint)
+				return ""
+			}
+		// 5-digit forms
+		case 5:
+			switch {
+			case 0x1_0000 <= char && char <= 0xF_FFFF:
+				// This space is intentionally left blank
+			default:
+				replaceErr = errors.New("illegal hexpoint:" + hexpoint)
+				return ""
+			}
+		// 6-digit forms
+		case 6:
+			switch {
+			case 0x10_0000 <= char && char <= 0x10_FFFF:
+				// This space is intentionally left blank
+			default:
+				replaceErr = errors.New("illegal hexpoint:" + hexpoint)
+				return ""
+			}
+		// the other invalid forms
+		default:
+			replaceErr = errors.New("illegal hexpoint:" + hexpoint)
+			return ""
+		}
+
+		return string(rune(char))
+	})
+	if replaceErr != nil {
+		return "", replaceErr
+	}
+
+	return decoded, nil
+}
+
+func decodeTypedAddress(val string) (DSNAddressType, string, error) {
+	tv := strings.SplitN(val, ";", 2)
+	if len(tv) != 2 || tv[0] == "" || tv[1] == "" {
+		return "", "", errors.New("bad address")
+	}
+	aType, aAddr := strings.ToUpper(tv[0]), tv[1]
+
+	var err error
+	switch DSNAddressType(aType) {
+	case DSNAddressTypeRFC822:
+		aAddr, err = decodeXtext(aAddr)
+		if err == nil && !isPrintableASCII(aAddr) {
+			err = errors.New("illegal address:" + aAddr)
+		}
+	case DSNAddressTypeUTF8:
+		aAddr, err = decodeUTF8AddrXtext(aAddr)
+	default:
+		err = errors.New("unknown address type:" + aType)
+	}
+	if err != nil {
+		return "", "", err
+	}
+
+	return DSNAddressType(aType), aAddr, nil
+}
+
 func encodeXtext(raw string) string {
 	var out strings.Builder
 	out.Grow(len(raw))
 
 	for _, ch := range raw {
-		if ch == '+' || ch == '=' {
+		switch {
+		case ch >= '!' && ch <= '~' && ch != '+' && ch != '=':
+			// printable non-space US-ASCII except '+' and '='
+			out.WriteRune(ch)
+		default:
 			out.WriteRune('+')
 			out.WriteString(strings.ToUpper(strconv.FormatInt(int64(ch), 16)))
 		}
-		if ch > '!' && ch < '~' { // printable non-space US-ASCII
-			out.WriteRune(ch)
-		}
-		// Non-ASCII.
-		out.WriteRune('+')
-		out.WriteString(strings.ToUpper(strconv.FormatInt(int64(ch), 16)))
 	}
 	return out.String()
+}
+
+// Encodes raw string to the utf-8-addr-xtext form in RFC 6533.
+func encodeUTF8AddrXtext(raw string) string {
+	var out strings.Builder
+	out.Grow(len(raw))
+
+	for _, ch := range raw {
+		switch {
+		case ch >= '!' && ch <= '~' && ch != '+' && ch != '=':
+			// printable non-space US-ASCII except '+' and '='
+			out.WriteRune(ch)
+		default:
+			out.WriteRune('\\')
+			out.WriteRune('x')
+			out.WriteRune('{')
+			out.WriteString(strings.ToUpper(strconv.FormatInt(int64(ch), 16)))
+			out.WriteRune('}')
+		}
+	}
+	return out.String()
+}
+
+// Encodes raw string to the utf-8-addr-unitext form in RFC 6533.
+func encodeUTF8AddrUnitext(raw string) string {
+	var out strings.Builder
+	out.Grow(len(raw))
+
+	for _, ch := range raw {
+		switch {
+		case ch >= '!' && ch <= '~' && ch != '+' && ch != '=':
+			// printable non-space US-ASCII except '+' and '='
+			out.WriteRune(ch)
+		case ch <= '\x7F':
+			// other ASCII: CTLs, space and specials
+			out.WriteRune('\\')
+			out.WriteRune('x')
+			out.WriteRune('{')
+			out.WriteString(strings.ToUpper(strconv.FormatInt(int64(ch), 16)))
+			out.WriteRune('}')
+		default:
+			// UTF-8 non-ASCII
+			out.WriteRune(ch)
+		}
+	}
+	return out.String()
+}
+
+func isPrintableASCII(val string) bool {
+	for _, ch := range val {
+		if ch < ' ' || '~' < ch {
+			return false
+		}
+	}
+	return true
 }
 
 // MAIL state -> waiting for RCPTs followed by DATA
@@ -458,29 +655,96 @@ func (c *Conn) handleRcpt(arg string) {
 		return
 	}
 
-	if (len(arg) < 4) || (strings.ToUpper(arg[0:3]) != "TO:") {
+	arg, ok := cutPrefixFold(arg, "TO:")
+	if !ok {
 		c.writeResponse(501, EnhancedCode{5, 5, 2}, "Was expecting RCPT arg syntax of TO:<address>")
 		return
 	}
 
-	// TODO: This trim is probably too forgiving
-	recipient := strings.Trim(arg[3:], "<> ")
+	p := parser{s: strings.TrimSpace(arg)}
+	recipient, err := p.parsePath()
+	if err != nil {
+		c.writeResponse(501, EnhancedCode{5, 5, 2}, "Was expecting RCPT arg syntax of TO:<address>")
+		return
+	}
 
 	if c.server.MaxRecipients > 0 && len(c.recipients) >= c.server.MaxRecipients {
 		c.writeResponse(452, EnhancedCode{4, 5, 3}, fmt.Sprintf("Maximum limit of %v recipients reached", c.server.MaxRecipients))
 		return
 	}
 
-	if err := c.Session().Rcpt(recipient); err != nil {
-		if smtpErr, ok := err.(*SMTPError); ok {
-			c.writeResponse(smtpErr.Code, smtpErr.EnhancedCode, smtpErr.Message)
+	args, err := parseArgs(p.s)
+	if err != nil {
+		c.writeResponse(501, EnhancedCode{5, 5, 4}, "Unable to parse RCPT ESMTP parameters")
+		return
+	}
+
+	opts := &RcptOptions{}
+
+	for key, value := range args {
+		switch key {
+		case "NOTIFY":
+			if !c.server.EnableDSN {
+				c.writeResponse(504, EnhancedCode{5, 5, 4}, "NOTIFY is not implemented")
+				return
+			}
+			notify := []DSNNotify{}
+			for _, val := range strings.Split(value, ",") {
+				notify = append(notify, DSNNotify(strings.ToUpper(val)))
+			}
+			if err := checkNotifySet(notify); err != nil {
+				c.writeResponse(501, EnhancedCode{5, 5, 4}, "Malformed NOTIFY parameter value")
+				return
+			}
+			opts.Notify = notify
+		case "ORCPT":
+			if !c.server.EnableDSN {
+				c.writeResponse(504, EnhancedCode{5, 5, 4}, "ORCPT is not implemented")
+				return
+			}
+			aType, aAddr, err := decodeTypedAddress(value)
+			if err != nil || aAddr == "" {
+				c.writeResponse(501, EnhancedCode{5, 5, 4}, "Malformed ORCPT parameter value")
+				return
+			}
+			opts.OriginalRecipientType = aType
+			opts.OriginalRecipient = aAddr
+		default:
+			c.writeResponse(500, EnhancedCode{5, 5, 4}, "Unknown RCPT TO argument")
 			return
 		}
-		c.writeResponse(451, EnhancedCode{4, 0, 0}, err.Error())
+	}
+
+	if err := c.Session().Rcpt(recipient, opts); err != nil {
+		c.writeError(451, EnhancedCode{4, 0, 0}, err)
 		return
 	}
 	c.recipients = append(c.recipients, recipient)
 	c.writeResponse(250, EnhancedCode{2, 0, 0}, fmt.Sprintf("I'll make sure <%v> gets this", recipient))
+}
+
+func checkNotifySet(values []DSNNotify) error {
+	if len(values) == 0 {
+		return errors.New("Malformed NOTIFY parameter value")
+	}
+
+	seen := map[DSNNotify]struct{}{}
+	for _, val := range values {
+		switch val {
+		case DSNNotifyNever, DSNNotifyDelayed, DSNNotifyFailure, DSNNotifySuccess:
+			if _, ok := seen[val]; ok {
+				return errors.New("Malformed NOTIFY parameter value")
+			}
+		default:
+			return errors.New("Malformed NOTIFY parameter value")
+		}
+		seen[val] = struct{}{}
+	}
+	if _, ok := seen[DSNNotifyNever]; ok && len(seen) > 1 {
+		return errors.New("Malformed NOTIFY parameter value")
+	}
+
+	return nil
 }
 
 func (c *Conn) handleAuth(arg string) {
@@ -499,7 +763,7 @@ func (c *Conn) handleAuth(arg string) {
 		return
 	}
 
-	if _, isTLS := c.TLSConnectionState(); !isTLS && !c.server.AllowInsecureAuth {
+	if !c.authAllowed() {
 		c.writeResponse(523, EnhancedCode{5, 7, 10}, "TLS is required")
 		return
 	}
@@ -510,29 +774,24 @@ func (c *Conn) handleAuth(arg string) {
 	var ir []byte
 	if len(parts) > 1 {
 		var err error
-		ir, err = base64.StdEncoding.DecodeString(parts[1])
+		ir, err = decodeSASLResponse(parts[1])
 		if err != nil {
+			c.writeResponse(454, EnhancedCode{4, 7, 0}, "Invalid base64 data")
 			return
 		}
 	}
 
-	newSasl, ok := c.server.auths[mechanism]
-	if !ok {
-		c.writeResponse(504, EnhancedCode{5, 7, 4}, "Unsupported authentication mechanism")
+	sasl, err := c.auth(mechanism)
+	if err != nil {
+		c.writeError(454, EnhancedCode{4, 7, 0}, err)
 		return
 	}
-
-	sasl := newSasl(c)
 
 	response := ir
 	for {
 		challenge, done, err := sasl.Next(response)
 		if err != nil {
-			if smtpErr, ok := err.(*SMTPError); ok {
-				c.writeResponse(smtpErr.Code, smtpErr.EnhancedCode, smtpErr.Message)
-				return
-			}
-			c.writeResponse(454, EnhancedCode{4, 7, 0}, err.Error())
+			c.writeError(454, EnhancedCode{4, 7, 0}, err)
 			return
 		}
 
@@ -557,7 +816,7 @@ func (c *Conn) handleAuth(arg string) {
 			return
 		}
 
-		response, err = base64.StdEncoding.DecodeString(encoded)
+		response, err = decodeSASLResponse(encoded)
 		if err != nil {
 			c.writeResponse(454, EnhancedCode{4, 7, 0}, "Invalid base64 data")
 			return
@@ -566,6 +825,27 @@ func (c *Conn) handleAuth(arg string) {
 
 	c.writeResponse(235, EnhancedCode{2, 0, 0}, "Authentication succeeded")
 	c.didAuth = true
+}
+
+func decodeSASLResponse(s string) ([]byte, error) {
+	if s == "=" {
+		return []byte{}, nil
+	}
+	return base64.StdEncoding.DecodeString(s)
+}
+
+func (c *Conn) authMechanisms() []string {
+	if authSession, ok := c.Session().(AuthSession); ok {
+		return authSession.AuthMechanisms()
+	}
+	return nil
+}
+
+func (c *Conn) auth(mech string) (sasl.Server, error) {
+	if authSession, ok := c.Session().(AuthSession); ok {
+		return authSession.Auth(mech)
+	}
+	return nil, ErrAuthUnknownMechanism
 }
 
 func (c *Conn) handleStartTLS() {
@@ -636,7 +916,7 @@ func (c *Conn) handleData(arg string) {
 	}
 
 	r := newDataReader(c)
-	code, enhancedCode, msg := toSMTPStatus(c.Session().Data(r))
+	code, enhancedCode, msg := dataErrorToStatus(c.Session().Data(r))
 	r.limited = false
 	io.Copy(ioutil.Discard, r) // Make sure all the data has been consumed
 	c.writeResponse(code, enhancedCode, msg)
@@ -674,7 +954,7 @@ func (c *Conn) handleBdat(arg string) {
 		return
 	}
 
-	if c.server.MaxMessageBytes != 0 && c.bytesReceived+int(size) > c.server.MaxMessageBytes {
+	if c.server.MaxMessageBytes != 0 && c.bytesReceived+int64(size) > c.server.MaxMessageBytes {
 		c.writeResponse(552, EnhancedCode{5, 3, 4}, "Max message size exceeded")
 
 		// Discard chunk itself without passing it to backend.
@@ -733,7 +1013,7 @@ func (c *Conn) handleBdat(arg string) {
 		// the whole chunk.
 		io.Copy(ioutil.Discard, chunk)
 
-		c.writeResponse(toSMTPStatus(err))
+		c.writeResponse(dataErrorToStatus(err))
 
 		if err == errPanic {
 			c.Close()
@@ -744,7 +1024,7 @@ func (c *Conn) handleBdat(arg string) {
 		return
 	}
 
-	c.bytesReceived += int(size)
+	c.bytesReceived += int64(size)
 
 	if last {
 		c.lineLimitReader.LineLimit = c.server.MaxLineLength
@@ -756,11 +1036,11 @@ func (c *Conn) handleBdat(arg string) {
 		if c.server.LMTP {
 			c.bdatStatus.fillRemaining(err)
 			for i, rcpt := range c.recipients {
-				code, enchCode, msg := toSMTPStatus(<-c.bdatStatus.status[i])
+				code, enchCode, msg := dataErrorToStatus(<-c.bdatStatus.status[i])
 				c.writeResponse(code, enchCode, "<"+rcpt+"> "+msg)
 			}
 		} else {
-			c.writeResponse(toSMTPStatus(err))
+			c.writeResponse(dataErrorToStatus(err))
 		}
 
 		if err == errPanic {
@@ -895,7 +1175,7 @@ func (c *Conn) handleDataLMTP() {
 	}
 
 	for i, rcpt := range c.recipients {
-		code, enchCode, msg := toSMTPStatus(<-status.status[i])
+		code, enchCode, msg := dataErrorToStatus(<-status.status[i])
 		c.writeResponse(code, enchCode, "<"+rcpt+"> "+msg)
 	}
 
@@ -906,12 +1186,12 @@ func (c *Conn) handleDataLMTP() {
 	}
 }
 
-func toSMTPStatus(err error) (code int, enchCode EnhancedCode, msg string) {
+func dataErrorToStatus(err error) (code int, enchCode EnhancedCode, msg string) {
 	if err != nil {
 		if smtperr, ok := err.(*SMTPError); ok {
 			return smtperr.Code, smtperr.EnhancedCode, smtperr.Message
 		} else {
-			return 554, EnhancedCode{5, 0, 0}, "Error: transaction failed, blame it on the weather: " + err.Error()
+			return 554, EnhancedCode{5, 0, 0}, "Error: transaction failed: " + err.Error()
 		}
 	}
 
@@ -956,6 +1236,14 @@ func (c *Conn) writeResponse(code int, enhCode EnhancedCode, text ...string) {
 		c.text.PrintfLine("%d %v", code, text[len(text)-1])
 	} else {
 		c.text.PrintfLine("%d %v.%v.%v %v", code, enhCode[0], enhCode[1], enhCode[2], text[len(text)-1])
+	}
+}
+
+func (c *Conn) writeError(code int, enhCode EnhancedCode, err error) {
+	if smtpErr, ok := err.(*SMTPError); ok {
+		c.writeResponse(smtpErr.Code, smtpErr.EnhancedCode, smtpErr.Message)
+	} else {
+		c.writeResponse(code, enhCode, err.Error())
 	}
 }
 

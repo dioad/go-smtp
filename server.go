@@ -10,17 +10,9 @@ import (
 	"os"
 	"sync"
 	"time"
-
-	"github.com/emersion/go-sasl"
 )
 
-var (
-	errTCPAndLMTP   = errors.New("smtp: cannot start LMTP server listening on a TCP socket")
-	ErrServerClosed = errors.New("smtp: server already closed")
-)
-
-// A function that creates SASL servers.
-type SaslServerFactory func(conn *Conn) sasl.Server
+var ErrServerClosed = errors.New("smtp: server already closed")
 
 // Logger interface is used by Server to report unexpected internal errors.
 type Logger interface {
@@ -30,20 +22,20 @@ type Logger interface {
 
 // A SMTP server.
 type Server struct {
+	// The type of network, "tcp" or "unix".
+	Network string
 	// TCP or Unix address to listen on.
 	Addr string
 	// The server TLS configuration.
 	TLSConfig *tls.Config
-	// Enable LMTP mode, as defined in RFC 2033. LMTP mode cannot be used with a
-	// TCP listener.
+	// Enable LMTP mode, as defined in RFC 2033.
 	LMTP bool
 
 	Domain            string
 	MaxRecipients     int
-	MaxMessageBytes   int
+	MaxMessageBytes   int64
 	MaxLineLength     int
 	AllowInsecureAuth bool
-	Strict            bool
 	Debug             io.Writer
 	ErrorLog          Logger
 	ReadTimeout       time.Duration
@@ -61,9 +53,9 @@ type Server struct {
 	// Should be used only if backend supports it.
 	EnableBINARYMIME bool
 
-	// If set, the AUTH command will not be advertised and authentication
-	// attempts will be rejected. This setting overrides AllowInsecureAuth.
-	AuthDisabled bool
+	// Advertise DSN (RFC 3461) capability.
+	// Should be used only if backend supports it.
+	EnableDSN bool
 
 	// If set, will not show greeting to new connections
 	ReverseProxyMode bool
@@ -71,11 +63,8 @@ type Server struct {
 	// The server backend.
 	Backend Backend
 
-	wg sync.WaitGroup
-
-	caps  []string
-	auths map[string]SaslServerFactory
-	done  chan struct{}
+	wg   sync.WaitGroup
+	done chan struct{}
 
 	locker    sync.Mutex
 	listeners []net.Listener
@@ -91,24 +80,7 @@ func NewServer(be Backend) *Server {
 		Backend:  be,
 		done:     make(chan struct{}, 1),
 		ErrorLog: log.New(os.Stderr, "smtp/server ", log.LstdFlags),
-		caps:     []string{"PIPELINING", "8BITMIME", "ENHANCEDSTATUSCODES", "CHUNKING"},
-		auths: map[string]SaslServerFactory{
-			sasl.Plain: func(conn *Conn) sasl.Server {
-				return sasl.NewPlainServer(func(identity, username, password string) error {
-					if identity != "" && identity != username {
-						return errors.New("Identities not supported")
-					}
-
-					sess := conn.Session()
-					if sess == nil {
-						panic("No session when AUTH is called")
-					}
-
-					return sess.AuthPlain(username, password)
-				})
-			},
-		},
-		conns: make(map[*Conn]struct{}),
+		conns:    make(map[*Conn]struct{}),
 	}
 }
 
@@ -151,7 +123,7 @@ func (s *Server) Serve(l net.Listener) error {
 
 			err := s.handleConn(newConn(c, s))
 			if err != nil {
-				s.ErrorLog.Printf("handler error: %s", err)
+				s.ErrorLog.Printf("error handling %v: %s", c.RemoteAddr(), err)
 			}
 		}()
 	}
@@ -216,15 +188,22 @@ func (s *Server) handleConn(c *Conn) error {
 	}
 }
 
+func (s *Server) network() string {
+	if s.Network != "" {
+		return s.Network
+	}
+	if s.LMTP {
+		return "unix"
+	}
+	return "tcp"
+}
+
 // ListenAndServe listens on the network address s.Addr and then calls Serve
 // to handle requests on incoming connections.
 //
 // If s.Addr is blank and LMTP is disabled, ":smtp" is used.
 func (s *Server) ListenAndServe() error {
-	network := "tcp"
-	if s.LMTP {
-		network = "unix"
-	}
+	network := s.network()
 
 	addr := s.Addr
 	if !s.LMTP && addr == "" {
@@ -242,18 +221,16 @@ func (s *Server) ListenAndServe() error {
 // ListenAndServeTLS listens on the TCP network address s.Addr and then calls
 // Serve to handle requests on incoming TLS connections.
 //
-// If s.Addr is blank, ":smtps" is used.
+// If s.Addr is blank and LMTP is disabled, ":smtps" is used.
 func (s *Server) ListenAndServeTLS() error {
-	if s.LMTP {
-		return errTCPAndLMTP
-	}
+	network := s.network()
 
 	addr := s.Addr
-	if addr == "" {
+	if !s.LMTP && addr == "" {
 		addr = ":smtps"
 	}
 
-	l, err := tls.Listen("tcp", addr, s.TLSConfig)
+	l, err := tls.Listen(network, addr, s.TLSConfig)
 	if err != nil {
 		return err
 	}
@@ -324,22 +301,5 @@ func (s *Server) Shutdown(ctx context.Context) error {
 		return ctx.Err()
 	case <-connDone:
 		return err
-	}
-}
-
-// EnableAuth enables an authentication mechanism on this server.
-//
-// This function should not be called directly, it must only be used by
-// libraries implementing extensions of the SMTP protocol.
-func (s *Server) EnableAuth(name string, f SaslServerFactory) {
-	s.auths[name] = f
-}
-
-// ForEachConn iterates through all opened connections.
-func (s *Server) ForEachConn(f func(*Conn)) {
-	s.locker.Lock()
-	defer s.locker.Unlock()
-	for conn := range s.conns {
-		f(conn)
 	}
 }
