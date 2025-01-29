@@ -301,6 +301,11 @@ func (c *Client) ehlo() error {
 	return err
 }
 
+// Still required by maddy
+func (c *Client) StartTLS(config *tls.Config) error {
+	return c.startTLS(config)
+}
+
 // startTLS sends the STARTTLS command and encrypts all further communication.
 // Only servers that advertise the STARTTLS extension support this function.
 //
