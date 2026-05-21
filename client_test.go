@@ -150,8 +150,10 @@ Goodbye.`
 	if _, err := w.Write([]byte(msg)); err != nil {
 		t.Fatalf("Data write failed: %s", err)
 	}
-	if err := w.Close(); err != nil {
+	if resp, err := w.CloseWithResponse(); err != nil {
 		t.Fatalf("Bad data response: %s", err)
+	} else if want := "Data OK"; resp.StatusText != want {
+		t.Errorf("Bad data status text: got %q, want %q", resp.StatusText, want)
 	}
 
 	if err := c.Quit(); err != nil {
@@ -916,35 +918,33 @@ Line 1
 .Leading dot line .
 Goodbye.`
 
-	rcpts := []string{}
-	errors := []*SMTPError{}
-
-	w, err := c.LMTPData(func(rcpt string, status *SMTPError) {
-		rcpts = append(rcpts, rcpt)
-		errors = append(errors, status)
-	})
+	w, err := c.Data()
 	if err != nil {
 		t.Fatalf("DATA failed: %s", err)
 	}
 	if _, err := w.Write([]byte(msg)); err != nil {
 		t.Fatalf("Data write failed: %s", err)
 	}
-	if err := w.Close(); err != nil {
-		t.Fatalf("Bad data response: %s", err)
+	resp, err := w.CloseWithLMTPResponse()
+
+	var lmtpErr LMTPDataError
+	if !errors.As(err, &lmtpErr) {
+		t.Fatalf("Want error of type LMTPDataError")
 	}
 
-	if !reflect.DeepEqual(rcpts, []string{"golang-nuts@googlegroups.com", "golang-not-nuts@googlegroups.com"}) {
-		t.Fatal("Status callbacks called for wrong recipients:", rcpts)
+	wantResp := map[string]*DataResponse{
+		"golang-nuts@googlegroups.com": {StatusText: "This recipient is fine"},
 	}
 
-	if len(errors) != 2 {
-		t.Fatalf("Wrong amount of status callback calls: %v", len(errors))
+	if !reflect.DeepEqual(resp, wantResp) {
+		t.Fatalf("resp = %v, want %v", resp, wantResp)
 	}
-	if errors[0] != nil {
-		t.Fatalf("Unexpected error status for the first recipient: %v", errors[0])
+
+	if len(lmtpErr) != 1 {
+		t.Fatalf("len(lmtpErr) = %v, want 1", len(lmtpErr))
 	}
-	if errors[1] == nil {
-		t.Fatalf("Unexpected success status for the second recipient")
+	if lmtpErr["golang-not-nuts@googlegroups.com"] == nil {
+		t.Fatalf("Want error for second recipient")
 	}
 
 	if err := c.Quit(); err != nil {
@@ -1038,6 +1038,110 @@ func TestClientDSN(t *testing.T) {
 	c.Rcpt(dsnEmailUTF8, &RcptOptions{
 		OriginalRecipientType: DSNAddressTypeUTF8,
 		OriginalRecipient:     dsnEmailUTF8,
+	})
+	c.Close()
+	if actualcmds := wrote.String(); client != actualcmds {
+		t.Errorf("wrote %q; want %q", actualcmds, client)
+	}
+}
+
+var rrvsServer = `220 hello world
+250 ok
+250 ok
+`
+
+var rrvsClient = `RCPT TO:<root@nsa.gov> RRVS=2014-04-03T23:01:00Z
+RCPT TO:<root@gchq.gov.uk>
+`
+
+func TestClientRRVS(t *testing.T) {
+	server := strings.Join(strings.Split(rrvsServer, "\n"), "\r\n")
+	client := strings.Join(strings.Split(rrvsClient, "\n"), "\r\n")
+
+	var wrote bytes.Buffer
+	var fake faker
+	fake.ReadWriter = struct {
+		io.Reader
+		io.Writer
+	}{
+		strings.NewReader(server),
+		&wrote,
+	}
+	c := NewClient(fake)
+	c.didHello = true
+	c.ext = map[string]string{"RRVS": ""}
+	c.Rcpt("root@nsa.gov", &RcptOptions{
+		RequireRecipientValidSince: time.Date(2014, time.April, 3, 23, 1, 0, 0, time.UTC),
+	})
+	c.Rcpt("root@gchq.gov.uk", &RcptOptions{})
+	c.Close()
+	if actualcmds := wrote.String(); client != actualcmds {
+		t.Errorf("wrote %q; want %q", actualcmds, client)
+	}
+}
+
+var deliverByServer = `220 hello world
+250 ok
+`
+
+var deliverByClient = `RCPT TO:<root@nsa.gov> BY=100;RT
+`
+
+func TestClientDELIVERBY(t *testing.T) {
+	server := strings.Join(strings.Split(deliverByServer, "\n"), "\r\n")
+	client := strings.Join(strings.Split(deliverByClient, "\n"), "\r\n")
+
+	var wrote bytes.Buffer
+	var fake faker
+	fake.ReadWriter = struct {
+		io.Reader
+		io.Writer
+	}{
+		strings.NewReader(server),
+		&wrote,
+	}
+	c := NewClient(fake)
+	c.didHello = true
+	c.ext = map[string]string{"DELIVERBY": ""}
+	c.Rcpt("root@nsa.gov", &RcptOptions{
+		DeliverBy: &DeliverByOptions{
+			Time:  100 * time.Second,
+			Mode:  DeliverByReturn,
+			Trace: true,
+		},
+	})
+	c.Close()
+	if actualcmds := wrote.String(); client != actualcmds {
+		t.Errorf("wrote %q; want %q", actualcmds, client)
+	}
+}
+
+var mtPriorityServer = `220 hello world
+250 ok
+`
+
+var mtPriorityClient = `RCPT TO:<root@nsa.gov> MT-PRIORITY=6
+`
+
+func TestClientMTPRIORITY(t *testing.T) {
+	server := strings.Join(strings.Split(mtPriorityServer, "\n"), "\r\n")
+	client := strings.Join(strings.Split(mtPriorityClient, "\n"), "\r\n")
+
+	var wrote bytes.Buffer
+	var fake faker
+	fake.ReadWriter = struct {
+		io.Reader
+		io.Writer
+	}{
+		strings.NewReader(server),
+		&wrote,
+	}
+	c := NewClient(fake)
+	c.didHello = true
+	c.ext = map[string]string{"MT-PRIORITY": ""}
+	priority := 6
+	c.Rcpt("root@nsa.gov", &RcptOptions{
+		MTPriority: &priority,
 	})
 	c.Close()
 	if actualcmds := wrote.String(); client != actualcmds {
