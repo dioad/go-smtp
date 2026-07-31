@@ -41,6 +41,14 @@ type Server struct {
 	ReadTimeout       time.Duration
 	WriteTimeout      time.Duration
 
+	// ConnErrorHandler, if set, is called instead of ErrorLog.Printf when
+	// handleConn returns an error for an accepted connection. It receives
+	// the remote address as a typed net.Addr rather than pre-formatted
+	// into a message string, so callers can log it as a structured field
+	// (e.g. for correlation with per-connection access logs) instead of
+	// only as a free-text substring.
+	ConnErrorHandler func(remoteAddr net.Addr, err error)
+
 	// Advertise SMTPUTF8 (RFC 6531) capability.
 	// Should be used only if backend supports it.
 	EnableSMTPUTF8 bool
@@ -145,7 +153,11 @@ func (s *Server) Serve(l net.Listener) error {
 
 			err := s.handleConn(newConn(c, s))
 			if err != nil {
-				s.ErrorLog.Printf("error handling %v: %s", c.RemoteAddr(), err)
+				if s.ConnErrorHandler != nil {
+					s.ConnErrorHandler(c.RemoteAddr(), err)
+				} else {
+					s.ErrorLog.Printf("error handling %v: %s", c.RemoteAddr(), err)
+				}
 			}
 		}()
 	}
