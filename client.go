@@ -385,7 +385,7 @@ func (c *Client) Auth(a sasl.Client) error {
 	} else if resp != nil {
 		resp64 = []byte{'='}
 	}
-	code, msg64, err := c.cmd(0, strings.TrimSpace(fmt.Sprintf("AUTH %s %s", mech, resp64)))
+	code, msg64, err := c.cmd(0, "%s", strings.TrimSpace(fmt.Sprintf("AUTH %s %s", mech, resp64)))
 	for err == nil {
 		var msg []byte
 		switch code {
@@ -414,7 +414,7 @@ func (c *Client) Auth(a sasl.Client) error {
 		}
 		resp64 = make([]byte, encoding.EncodedLen(len(resp)))
 		encoding.Encode(resp64, resp)
-		code, msg64, err = c.cmd(0, string(resp64))
+		code, msg64, err = c.cmd(0, "%s", string(resp64))
 	}
 	return err
 }
@@ -727,7 +727,11 @@ func (c *Client) Data() (*DataCommand, error) {
 func (c *Client) SendMail(from string, to []string, r io.Reader) error {
 	var err error
 
-	if err = c.Mail(from, nil); err != nil {
+	var opts *MailOptions
+	if !isASCII(from) || !allASCII(to) {
+		opts = &MailOptions{UTF8: true}
+	}
+	if err = c.Mail(from, opts); err != nil {
 		return err
 	}
 	for _, addr := range to {
@@ -963,4 +967,22 @@ func validateLine(line string) error {
 		return errors.New("smtp: a line must not contain CR or LF")
 	}
 	return nil
+}
+
+func isASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] > 127 {
+			return false
+		}
+	}
+	return true
+}
+
+func allASCII(ss []string) bool {
+	for _, s := range ss {
+		if !isASCII(s) {
+			return false
+		}
+	}
+	return true
 }
